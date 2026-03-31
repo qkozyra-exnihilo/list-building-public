@@ -1,0 +1,10 @@
+# API keys
+*.rtf
+*_api_key.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
