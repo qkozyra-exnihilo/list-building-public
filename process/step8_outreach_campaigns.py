@@ -3,7 +3,7 @@
 step8_outreach_campaigns.py — Create outreach campaigns and push leads via API
 ================================================================================
 Input:  {project_name}_FINAL.csv
-Output: Campaigns created via outreach API (1 per sales rep, paused)
+Output: Campaigns created via Lemlist API (1 per sales rep, paused)
 
 Logic:
   1. Load FINAL.csv
@@ -28,11 +28,12 @@ import time
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-OUTREACH_API_KEY_ENV = "OUTREACH_API_KEY"
-OUTREACH_BASE = "https://api.your-outreach-tool.com/api"
+OUTREACH_API_KEY_ENV = "LEMLIST_API_KEY"
+OUTREACH_BASE = "https://api.lemlist.com/api"
 
-FR_POOL = ['sales1@example.com', 'sales2@example.com']
-ROW_POOL = ['sales3@example.com', 'sales4@example.com', 'sales5@example.com']
+# Configure with your own team's rep emails.
+FR_POOL = ['rep-a@example.com', 'rep-b@example.com']
+ROW_POOL = ['rep-c@example.com', 'rep-d@example.com']
 
 FRANCOPHONE_COUNTRIES = {
     'FR', 'BE', 'CH', 'LU', 'MA', 'TN', 'DZ', 'SN', 'CI', 'CM',
@@ -241,7 +242,7 @@ def build_lead_variables(row):
 
 
 def get_rep_first_name(email):
-    """Extract first name from sales rep email. E.g. sales1@example.com -> Sales1."""
+    """Extract first name from sales rep email. E.g. rep-a@example.com -> Rep-a."""
     local = email.split('@')[0]
     # Handle firstname.lastname format
     name = local.split('.')[0]
@@ -256,6 +257,8 @@ def main():
                         help="Project name (used for campaign naming)")
     parser.add_argument("--input", required=True, dest="input_file",
                         help="Path to FINAL.csv")
+    parser.add_argument("--owner-pool", dest="owner_pool", default=None,
+                        help="Override round robin: comma-separated emails (e.g. rep-a@example.com)")
     args = parser.parse_args()
 
     # ── Resolve paths ─────────────────────────────────────────────────────────
@@ -284,11 +287,17 @@ def main():
     print(f"{'='*60}")
     print(f"Input: {input_path} ({len(contacts)} contacts)")
 
+    # ── Parse owner pool override ───────────────────────────────────────────────
+    owner_pool_override = None
+    if args.owner_pool:
+        owner_pool_override = [e.strip() for e in args.owner_pool.split(',')]
+
     # ── Assign contacts to sales reps via round robin ─────────────────────────
     # Group companies by domain first, assign owner per company (not per contact)
     company_owners = {}  # domain -> rep email
     fr_counter = 0
     row_counter = 0
+    pool_counter = 0
 
     # First pass: assign owners to companies
     for row in contacts:
@@ -297,13 +306,17 @@ def main():
         if not domain or domain in company_owners:
             continue
 
-        cc = get_contact_country(row)
-        if cc in FRANCOPHONE_COUNTRIES:
-            company_owners[domain] = FR_POOL[fr_counter % len(FR_POOL)]
-            fr_counter += 1
+        if owner_pool_override:
+            company_owners[domain] = owner_pool_override[pool_counter % len(owner_pool_override)]
+            pool_counter += 1
         else:
-            company_owners[domain] = ROW_POOL[row_counter % len(ROW_POOL)]
-            row_counter += 1
+            cc = get_contact_country(row)
+            if cc in FRANCOPHONE_COUNTRIES:
+                company_owners[domain] = FR_POOL[fr_counter % len(FR_POOL)]
+                fr_counter += 1
+            else:
+                company_owners[domain] = ROW_POOL[row_counter % len(ROW_POOL)]
+                row_counter += 1
 
     # Second pass: assign rep to each contact based on company
     rep_contacts = {}  # rep email -> list of rows

@@ -286,8 +286,11 @@ def main():
                 continue
             uncovered.append(r)
 
+        # NB: distinct filename — {project}_uncovered_companies.csv belongs to
+        # Step 4 (it carries the zero_pronto_leads / leads_all_filtered split);
+        # step6 used to clobber it (found 2026-07-02).
         uncovered_path = os.path.join(os.path.dirname(os.path.abspath(input_path)),
-                                       f"{project_name}_uncovered_companies.csv")
+                                       f"{project_name}_step6_uncovered_companies.csv")
         if uncovered:
             unc_fields = list(uncovered[0].keys())
             with open(uncovered_path, "w", newline="", encoding="utf-8") as f:

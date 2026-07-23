@@ -24,10 +24,72 @@ Usage:
 
 import argparse
 import csv
+import difflib
 import json
 import os
 import re
 import sys
+
+
+# ── Slug sanity check ─────────────────────────────────────────────────────────
+# Flag companies where Apollo's LinkedIn slug diverges from the company name.
+# Background: Apollo sometimes stores stale slugs (e.g. Skeepers cached as
+# "s-keeper" from before the rebrand). A wrong slug means the Pronto account-list
+# search scopes to the wrong company and returns 0 leads — a silent failure.
+#
+# This is a "soft signal." Fuzzy character-match is unreliable for one-character-off
+# slugs (Skeepers/s-keeper scores 0.93 — looks fine, isn't). The strong defense is
+# the zero-leads alarm in step4 that catches misfires by behavior. This check is
+# preventive: surfaces the obvious cases before Pronto credits are spent.
+SLUG_NAME_SIMILARITY_THRESHOLD = 0.85
+SUSPICIOUS_BRAND_PREFIXES = ('get', 'hello', 'join', 'try', 'use', 'my', 'the', 'go')
+
+
+def _normalize_for_slug_check(s: str) -> str:
+    s = (s or '').lower().strip()
+    s = re.sub(r'[^a-z0-9]+', '', s)
+    return s
+
+
+def _extract_slug(linkedin_url: str) -> str:
+    """Pull the /company/<slug> portion out of a LinkedIn URL."""
+    if not linkedin_url:
+        return ''
+    m = re.search(r'/company/([^/?#]+)', linkedin_url.lower())
+    return m.group(1) if m else ''
+
+
+def slug_looks_suspicious(company_name: str, linkedin_url: str) -> bool:
+    """
+    True if the LinkedIn slug is suspiciously different from the company name.
+
+    Conservative by design: this misses some real misfires (the Skeepers case
+    where slug = "s-keeper" vs name = "skeepers" scores 0.93 similar — only a
+    live LinkedIn check would catch that). The zero-leads alarm in step4 is the
+    catch-all safety net by behavior; this check is a cheap up-front signal for
+    the obvious cases where it'd be wasteful to spend Pronto credits.
+    """
+    slug = _extract_slug(linkedin_url)
+    if not slug or slug.isdigit():
+        return False
+    norm_name = _normalize_for_slug_check(company_name)
+    norm_slug = _normalize_for_slug_check(slug)
+    if not norm_name or not norm_slug:
+        return False
+    # Either string is a prefix/contains the other → considered safe (covers
+    # cases like "Time One"/"timeone-group", "Dust"/"dust-tt", "Crisp"/"crispgrowth").
+    # Crisp slipping through is a known false-negative — the zero-leads alarm catches it.
+    if norm_name in norm_slug or norm_slug in norm_name:
+        return False
+    # Branded prefix (get/hello/the/etc) + recognizable tail = safe.
+    for prefix in SUSPICIOUS_BRAND_PREFIXES:
+        if norm_slug.startswith(prefix):
+            tail = norm_slug[len(prefix):]
+            if tail and (norm_name in tail or tail in norm_name or
+                         difflib.SequenceMatcher(None, norm_name, tail).ratio() >= 0.7):
+                return False
+    # Otherwise: low similarity is suspicious enough to flag.
+    return difflib.SequenceMatcher(None, norm_name, norm_slug).ratio() < 0.6
 import time
 import urllib.request
 import urllib.error
@@ -52,30 +114,44 @@ APOLLO_DB_COLUMNS = [
     "headcount_24m_growth", "source_project", "enriched_date"
 ]
 
-# ── ICP Filter: Target industries (case-insensitive) ─────────────────────────
-TARGET_INDUSTRIES = [
-    "information technology & services",
-    "computer software",
-    "computer & network security",
-    "computer games",
-    "computer hardware",
-    "computer networking",
-    "program development",
-    "telecommunications",
-    "information services",
+# ── ICP Filter: NAICS exclusion list ─────────────────────────────────────────
+# The primary ICP gate is Step 1d (LLM homepage classifier). This filter is a
+# safety net: drop companies whose NAICS codes indicate a business model that
+# structurally cannot be B2B SaaS (physical-goods retail, in-person services,
+# food/hospitality, funeral services, etc.).
+#
+# Keep this list narrow. If a company sells software FOR one of these verticals
+# (proptech, healthtech, logistics tech…), their NAICS usually sits in the
+# "professional services" / "computer services" range instead, not the
+# operating-business codes below.
+EXCLUDED_NAICS_PREFIXES = [
+    "11",     # Agriculture, Forestry, Fishing, Hunting (production)
+    "21",     # Mining, Quarrying, Oil & Gas Extraction
+    "23",     # Construction (physical building)
+    "44",     # Retail Trade
+    "45",     # Retail Trade
+    "72",     # Accommodation & Food Services (restaurants, hotels)
+    "81211",  # Hair, Nail, Skin Salons
+    "81221",  # Funeral Services
+    "81232",  # Industrial Launderers
+    "81293",  # Parking Lots & Garages
+    "713",    # Amusement / Gambling / Recreation (physical venues)
+    "71213",  # Historical Sites
+    "62441",  # Child Day Care Services
+    "7224",   # Drinking Places
 ]
 
-# ── ICP Filter: NAICS prefixes ───────────────────────────────────────────────
-TARGET_NAICS_PREFIXES = ["5132", "5112", "5182", "5415", "519", "517"]
-
-# ── ICP Filter: Keywords ─────────────────────────────────────────────────────
-INCLUDE_KEYWORDS = [
-    "saas", "ai", "software", "cloud", "platform", "computer",
-    "analytics", "automation", "artificial intelligence", "consulting",
-]
-
+# ── ICP Filter: Keyword exclusions (supplementary) ───────────────────────────
+# Applied only when no positive SaaS signal (include keyword) is present.
+# Used to catch non-SaaS companies whose NAICS is ambiguous.
 EXCLUDE_KEYWORDS = [
-    "non-profit", "billing", "food", "farming", "maritime", "sporting",
+    "non-profit", "food", "farming", "maritime", "sporting goods",
+]
+
+# Positive signals used for the "consulting" tiebreaker below.
+INCLUDE_KEYWORDS = [
+    "saas", "ai", "software", "cloud", "platform", "api",
+    "analytics", "automation", "artificial intelligence",
 ]
 
 # ── NAICS 2-digit sector labels ──────────────────────────────────────────────
@@ -311,89 +387,86 @@ def get_naics_label(naics_code: str) -> str:
     return ""
 
 
-def apply_icp_filter(rows: list) -> tuple:
+def apply_icp_filter(rows: list, max_employees=None, min_employees=None) -> tuple:
     """
-    Apply the ICP filter (industry/NAICS + keyword confirmation).
-    Returns (kept_rows, dropped_rows, stats_dict).
+    NAICS exclusion-only ICP filter. Drops companies whose NAICS matches a
+    structurally-not-SaaS sector (physical retail, hospitality, construction,
+    etc.). Also drops companies flagged as "consulting" or "X-only-exclude"
+    keywords with no positive SaaS signal, as a supplementary guard.
 
-    Stats dict has keys: confirmed_keywords, kept_no_keywords, kept_no_data, dropped.
+    Company-size gate (employee count from Apollo's estimated_num_employees):
+    drops companies above max_employees (too big for the SMB/scaleup ICP) or
+    below min_employees. Companies with an unknown employee count are KEPT
+    (we never drop on missing data). max_employees=None disables the upper cap.
+
+    The primary ICP gate is Step 1d (LLM homepage classifier) — this filter
+    exists to catch obvious non-SaaS where the homepage check was skipped or
+    unreachable.
+
+    Returns (kept_rows, dropped_rows, stats_dict).
+    Stats: kept, dropped_naics, dropped_keywords, dropped_size.
     """
     kept = []
     dropped = []
-    stats = {
-        "confirmed_keywords": 0,
-        "kept_no_keywords": 0,
-        "kept_no_data": 0,
-        "dropped": 0,
-    }
+    stats = {"kept": 0, "dropped_naics": 0, "dropped_keywords": 0, "dropped_size": 0}
 
     for row in rows:
-        industry = row.get("industry", "").strip().lower()
+        # Layer 0: company-size gate. Unknown count → keep (never drop on missing data).
+        emp_raw = (row.get("employee_count") or "").strip()
+        emp = None
+        if emp_raw:
+            try:
+                emp = int(float(emp_raw))
+            except ValueError:
+                emp = None
+        if emp is not None and (
+            (max_employees is not None and emp > max_employees)
+            or (min_employees is not None and emp < min_employees)
+        ):
+            stats["dropped_size"] += 1
+            dropped.append(row)
+            continue
+
         naics_code = row.get("naics_code", "").strip()
         keywords_str = row.get("keywords", "").strip().lower()
 
-        # Check industry match
-        industry_match = any(t == industry for t in TARGET_INDUSTRIES)
-
-        # Check NAICS match
-        naics_match = False
-        if naics_code:
-            for prefix in TARGET_NAICS_PREFIXES:
-                if naics_code.startswith(prefix):
-                    naics_match = True
-                    break
-
-        # Case 3: no industry AND no NAICS -> keep for manual review
-        if not industry and not naics_code:
-            stats["kept_no_data"] += 1
-            kept.append(row)
-            continue
-
-        # No match on either layer
-        if not industry_match and not naics_match:
-            stats["dropped"] += 1
-            dropped.append(row)
-            continue
-
-        # Industry or NAICS matches -> check keywords
-        if not keywords_str:
-            # No keywords available, can't verify -> keep
-            stats["kept_no_keywords"] += 1
-            kept.append(row)
-            continue
-
-        # Parse keywords
-        kw_parts = [k.strip() for k in re.split(r"[;,]", keywords_str) if k.strip()]
-
-        has_include = any(
-            inc_kw in kw for inc_kw in INCLUDE_KEYWORDS if inc_kw != "consulting"
-            for kw in kw_parts
+        # Parse keywords and look for positive SaaS signal (used to rescue
+        # vertical SaaS whose NAICS reflects their customers, e.g. a SaaS for
+        # restaurants gets NAICS 72251 but has "saas; platform" in keywords).
+        kw_parts = (
+            [k.strip() for k in re.split(r"[;,]", keywords_str) if k.strip()]
+            if keywords_str else []
         )
+        has_include = any(inc in kw for inc in INCLUDE_KEYWORDS for kw in kw_parts)
         has_consulting = any("consulting" in kw for kw in kw_parts)
-        has_only_exclude = all(
-            any(exc_kw in kw for exc_kw in EXCLUDE_KEYWORDS)
-            for kw in kw_parts
-        ) if kw_parts else False
+        has_only_exclude = (
+            bool(kw_parts)
+            and all(any(exc in kw for exc in EXCLUDE_KEYWORDS) for kw in kw_parts)
+        )
 
-        # Consulting special rule
+        # Layer 1: NAICS exclusion — only drops if no positive SaaS signal.
+        # Vertical SaaS like Gastronaut (72251 + "saas; platform" in keywords)
+        # is rescued by its keywords.
+        if naics_code and not has_include:
+            is_excluded = any(naics_code.startswith(p) for p in EXCLUDED_NAICS_PREFIXES)
+            if is_excluded:
+                stats["dropped_naics"] += 1
+                dropped.append(row)
+                continue
+
+        # Layer 2: pure consulting firms (no SaaS signal) → drop
         if has_consulting and not has_include:
-            # "consulting" only, no include keyword -> drop
-            stats["dropped"] += 1
+            stats["dropped_keywords"] += 1
             dropped.append(row)
             continue
 
-        if has_include:
-            stats["confirmed_keywords"] += 1
-            kept.append(row)
-            continue
-
-        if has_only_exclude:
-            stats["dropped"] += 1
+        # Layer 3: keywords are all excluded terms (e.g. "food; farming") → drop
+        if has_only_exclude and not has_include:
+            stats["dropped_keywords"] += 1
             dropped.append(row)
             continue
 
-        # Keywords exist but no include and no exclude -> keep (ambiguous)
-        stats["kept_no_keywords"] += 1
+        stats["kept"] += 1
         kept.append(row)
 
     return kept, dropped, stats
@@ -408,7 +481,13 @@ def main():
     parser.add_argument("--input", required=True, dest="input_file",
                         help="Path to input CSV (step1b or step1c)")
     parser.add_argument("--skip-icp-filter", action="store_true", dest="skip_icp_filter",
-                        help="Skip the ICP industry/NAICS/keyword filter")
+                        help="Skip the ICP industry/NAICS/keyword/size filter")
+    parser.add_argument("--max-employees", type=int, default=500, dest="max_employees",
+                        help="ICP size gate: drop companies above this employee count "
+                             "(default 500; unknown counts are kept). Use 0 to disable.")
+    parser.add_argument("--min-employees", type=int, default=None, dest="min_employees",
+                        help="ICP size gate: drop companies below this employee count "
+                             "(default disabled; unknown counts are kept).")
     args = parser.parse_args()
 
     # ── Resolve paths ─────────────────────────────────────────────────────────
@@ -534,6 +613,7 @@ def main():
     n_industry_filled = 0
     n_naics_filled = 0
     n_keywords_filled = 0
+    n_employees_filled = 0
 
     for row in companies:
         domain = row.get("domain", "").strip().lower()
@@ -574,10 +654,18 @@ def main():
                 row["keywords"] = keywords
                 n_keywords_filled += 1
 
+        # Employee count (needed for the size ICP gate; also fills the column)
+        if not row.get("employee_count", "").strip():
+            emp = db_row.get("estimated_num_employees", "").strip()
+            if emp:
+                row["employee_count"] = emp
+                n_employees_filled += 1
+
     print(f"  LinkedIn URLs filled:  {n_linkedin_filled}")
     print(f"  Industries filled:     {n_industry_filled}")
     print(f"  NAICS codes filled:    {n_naics_filled}")
     print(f"  Keywords filled:       {n_keywords_filled}")
+    print(f"  Employee counts filled:{n_employees_filled}")
 
     # ── Apply ICP filter ──────────────────────────────────────────────────────
     # Filter out MISSING_DOMAIN companies (they don't go to output)
@@ -590,14 +678,20 @@ def main():
         print(f"\n  ICP filter: SKIPPED (--skip-icp-filter)")
         output_rows = enrichable
     else:
+        max_emp = args.max_employees if args.max_employees and args.max_employees > 0 else None
         print(f"\n  Applying ICP filter...")
-        output_rows, dropped_rows, filter_stats = apply_icp_filter(enrichable)
+        if max_emp:
+            print(f"    Size gate: drop > {max_emp} employees"
+                  + (f", drop < {args.min_employees}" if args.min_employees else "")
+                  + " (unknown counts kept)")
+        output_rows, dropped_rows, filter_stats = apply_icp_filter(
+            enrichable, max_employees=max_emp, min_employees=args.min_employees)
 
-        print(f"  ICP Filter Results:")
-        print(f"    Kept (confirmed by keywords): {filter_stats['confirmed_keywords']}")
-        print(f"    Kept (no keywords, can't verify): {filter_stats['kept_no_keywords']}")
-        print(f"    Kept (no industry/NAICS data): {filter_stats['kept_no_data']}")
-        print(f"    Dropped: {filter_stats['dropped']}")
+        print(f"  ICP Filter Results (NAICS exclusion + size gate):")
+        print(f"    Kept:                     {filter_stats['kept']}")
+        print(f"    Dropped (NAICS excluded): {filter_stats['dropped_naics']}")
+        print(f"    Dropped (keyword rule):   {filter_stats['dropped_keywords']}")
+        print(f"    Dropped (size gate):      {filter_stats['dropped_size']}")
 
         if dropped_rows:
             print(f"\n  --- Dropped companies (sample, max 20) ---")
@@ -643,6 +737,22 @@ def main():
     if no_linkedin:
         print(f"WARNING: {len(no_linkedin)} companies have no LinkedIn URL after enrichment.")
         print(f"  Consider running step1c_domain_verification.py on the output to fix these.")
+        print()
+
+    # Slug sanity check: flag rows where Apollo's slug diverges from the name.
+    # A wrong slug = wrong Pronto scope = silent zero-leads. Catch it here.
+    suspicious = []
+    for row in output_rows:
+        url = row.get("linkedin_company_url", "").strip()
+        name = row.get("company_name", "").strip()
+        if url and slug_looks_suspicious(name, url):
+            suspicious.append((name, _extract_slug(url), url))
+    if suspicious:
+        print(f"WARNING: {len(suspicious)} companies have a LinkedIn slug that diverges from the company name.")
+        print(f"  These often come from stale Apollo data and will silently fail the Pronto account-list scope.")
+        print(f"  Review them — re-run step1c_domain_verification.py to refresh, or fix manually in apollo_companies_database.csv.")
+        for name, slug, _ in suspicious[:20]:
+            print(f"    {name!r:40s} -> slug={slug!r}")
         print()
 
 

@@ -33,56 +33,57 @@ import sys
 # ── Title matching logic (same as step4_contact_refinement.py) ────────────────
 
 CATEGORIES = [
-    ("RevOps", [
-        "revenue operations", "revops",
-        "cro", "chief revenue officer",
-        "vp revenue", "head of revenue", "revenue director", "director of revenue",
-    ]),
     ("Finance", [
         "cfo", "chief financial officer", "chief accounting officer",
         "vp finance", "vice president finance", "head of finance",
         "finance director", "financial director", "director of finance",
         "group cfo", "acting cfo", "sevp finance",
-        "controller", "financial controller",
+        # Controller / Financial Controller dropped 2026-06-09 (kept only via a
+        # qualifying finance-leadership title in a combined role).
         "vp financial operations", "head of financial operations",
         "director of financial planning", "vp fp&a", "head of fp&a",
+        "finance manager",
         # French
         "directeur financier", "directrice financière",
         "directeur administratif et financier", "directrice administrative et financière",
         "daf", "responsable financier", "responsable financière",
-        "contrôleur de gestion", "contrôleuse de gestion",
+        # NB: "contrôleur/contrôleuse de gestion" (FR controller) dropped 2026-06-09.
     ]),
-    ("COO", [
+    # Revenue (#2): leadership + Revenue Operations / RevOps, ALL levels.
+    ("Revenue", [
+        "revenue operations", "revops",
+        "cro", "chief revenue officer",
+        "vp revenue", "vp of revenue", "head of revenue",
+        "revenue director", "director of revenue",
+        "cco", "chief commercial officer",
+    ]),
+    # Ops (#3): general ops/COO + Sales Ops + Growth Ops + Business Ops, Head-of+ only.
+    ("Ops", [
         "coo", "chief operating officer", "chief operations officer",
         "vp operations", "vice president operations", "head of operations",
         "director of operations", "operations director",
-        "general manager", "founding chief operating officer",
+        "founding chief operating officer",
+        "head of business operations", "vp business operations",
+        "director of business operations", "business operations director",
+        "head of sales operations", "vp sales operations", "vp of sales operations",
+        "director of sales operations", "sales operations director",
+        "head of growth operations", "vp growth operations",
+        "director of growth operations", "growth operations director",
         # French
         "directeur des opérations", "directrice des opérations",
         "directeur opérationnel", "directrice opérationnelle",
         "directeur d'exploitation", "directrice d'exploitation",
     ]),
-    ("Founder", [
-        "founder", "co-founder", "cofounder",
-        "ceo", "chief executive officer", "co-ceo",
-        "president", "founding ceo", "founding partner", "entrepreneur",
-        # French
-        "directeur général", "directrice générale", "dg", "pdg",
-        "président directeur général", "président", "présidente",
-        "gérant", "gérante", "associé gérant",
-        "cofondateur", "cofondatrice", "fondateur", "fondatrice",
-        "co-fondateur", "co-fondatrice",
-        "dirigeant", "dirigeante",
-        "dga", "directeur général adjoint", "directrice générale adjointe",
-    ]),
+    # NB: Sales removed as a target persona 2026-06-16. Pure-sales leadership
+    # (Head of Sales / VP Sales / Sales Director / CSO / Directeur Commercial) now
+    # matches no inclusion and is neither pulled nor counted. Sales OPERATIONS stays
+    # under Ops above; CCO / Chief Commercial Officer stays under Revenue above.
 ]
 
 EXCLUSIONS = [
-    # Too junior
-    "revenue operations manager", "revenue operations associate",
-    "revenue operations specialist", "revenue operations analyst",
-    "revenue operations crm manager",
-    "operations manager", "finance manager",
+    # Too junior. NB: Revenue Operations roles (Manager/Analyst/Specialist) are NO
+    # LONGER excluded — kept under Revenue at all levels. Bare "operations manager"
+    # is dropped by matching no Head-of+ inclusion, not by an exclusion keyword.
     "project manager", "program manager",
     "assistant", "assistante", "office manager",
     "responsable administratif et financier", "responsable administrative et financière",
@@ -94,13 +95,18 @@ EXCLUSIONS = [
     "chief data officer", "cdo",
     "chief information officer", "cio",
     "chief of staff",
-    # Wrong operations
-    "business operations", "it operations", "technical operations",
-    "sales operations", "marketing operations",
+    # Wrong operations. NB: sales operations & business operations are NOT excluded
+    # anymore (kept at Head-of+ via the Ops category above).
+    "it operations", "technical operations",
+    "marketing operations",
     "devops", "dev ops",
     "back office", "responsable back-office",
     "head of ai operations", "head of people operations",
     "head of customer operations", "head of product operations",
+    # NB: Founders / CEO / President / GM are dropped by matching NO inclusion
+    # category (the Founder category was removed 2026-06). They are intentionally
+    # NOT listed here as exclusions — that would outrank inclusions and wrongly kill
+    # combined titles like "Chief Executive Officer & CFO" (a kept Finance contact).
     # Excluded leadership
     "managing director", "treasurer", "trésorier", "trésorière",
     # Deputy
@@ -124,7 +130,7 @@ EXCLUSIONS = [
 
 SHORT_KEYWORDS = {
     "dg", "daf", "pdg", "coo", "ceo", "cfo", "cro", "dga",
-    "cto", "cpo", "cmo", "cdo", "cio", "vc",
+    "cto", "cpo", "cmo", "cdo", "cio", "vc", "cco", "cso",
 }
 
 
@@ -148,7 +154,13 @@ def is_excluded(title_lower):
 
 
 def is_valid_contact(title):
-    """Return True if the title passes inclusion rules and is not excluded."""
+    """Return True if the title passes inclusion rules and is not excluded.
+
+    Used for PULLING DB contacts through into step4 — broad acceptance across the
+    three kept personas (Finance, Revenue, Ops). Founders/CEO/President/GM and pure
+    Sales (dropped 2026-06-16) match no category and are not pulled. Coverage
+    decisions use is_primary_persona().
+    """
     if not title or not title.strip():
         return False
     title_lower = title.lower()
@@ -164,13 +176,42 @@ def is_valid_contact(title):
     return False
 
 
+def is_primary_persona(title):
+    """Return True if the title is a primary target persona (Finance, Revenue, Ops).
+
+    Used for the "covered by DB" threshold check. Since Sales was dropped as a
+    persona (2026-06-16), the three kept categories ARE the primary personas, so
+    this now mirrors is_valid_contact. (Rule origin 2026-05-26, the Dust
+    false-coverage bug — Sales/founders were once supplement-only; both are now
+    dropped outright.)
+    """
+    if not title or not title.strip():
+        return False
+    title_lower = title.lower()
+
+    if is_excluded(title_lower):
+        return False
+
+    for cat_name, keywords in CATEGORIES:
+        for kw in keywords:
+            if keyword_in_title(kw.lower(), title_lower):
+                return True
+
+    return False
+
+
 # ── Helper functions ──────────────────────────────────────────────────────────
 
 def normalize_linkedin_url(url):
-    """Normalize LinkedIn company URL: lowercase, strip trailing /, remove query params."""
+    """Normalize LinkedIn company URL: lowercase, strip protocol/www/query/trailing /,
+    decode percent-encoding (Pronto stores e.g. l%27addition; found 2026-07-02 —
+    protocol+encoding mismatches made DB coverage silently return 0)."""
     if not url or not url.strip():
         return ''
-    url = url.strip().lower()
+    from urllib.parse import unquote
+    url = unquote(url.strip().lower())
+    url = re.sub(r'^https?://', '', url)
+    url = re.sub(r'^www\.', '', url)
     url = re.sub(r'[?&].*$', '', url)
     return url.rstrip('/')
 
@@ -210,7 +251,7 @@ def extract_linkedin_id(url):
     """
     Extract LinkedIn ID from company URL.
     Looks for numeric ID first in apollo DB, falls back to slug from URL.
-    E.g. https://www.linkedin.com/company/yourcompany -> yourcompany
+    E.g. https://www.linkedin.com/company/acme -> acme
     E.g. https://www.linkedin.com/company/12345 -> 12345
     """
     if not url:
@@ -224,6 +265,28 @@ def extract_linkedin_id(url):
     return ''
 
 
+# Apollo's `linkedin_uid` field is supposed to be the LinkedIn company numeric ID,
+# but Apollo sometimes populates it with their own internal organization_id
+# (24-character MongoDB ObjectId hex like "673082adcd1c1f0001827f97"). Pushing
+# that into the Pronto "LinkedIn ID" column either fails to resolve or matches
+# the wrong entity (see Skeepers/Foederis/etc. — Pronto-export audit 2026-05-26).
+APOLLO_ORG_ID_RE = re.compile(r'^[0-9a-f]{24}$')
+
+
+def sanitize_linkedin_uid(uid, linkedin_url=''):
+    """
+    Return a value safe to send as Pronto's "LinkedIn ID" column.
+    - Valid numeric LinkedIn IDs (digits only): pass through.
+    - Slugs (letters/digits/hyphens, not 24-char hex): pass through.
+    - Apollo org_ids (24-char hex): drop and fall back to URL slug.
+    - Empty / unrecognized: fall back to URL slug.
+    """
+    s = (uid or '').strip()
+    if s and not APOLLO_ORG_ID_RE.match(s.lower()):
+        return s
+    return extract_linkedin_id(linkedin_url)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check Pronto contacts DB for existing contacts, split companies "
@@ -233,6 +296,14 @@ def main():
                         help="Project name (used for output folder and filename)")
     parser.add_argument("--input", required=True, dest="input_file",
                         help="Path to step2 companies CSV")
+    parser.add_argument("--min-contacts", type=int, default=2, dest="min_contacts",
+                        help="Primary-persona DB contacts to consider a company 'covered' "
+                             "and skip Pronto search (default 2)")
+    parser.add_argument("--max-coverage", action="store_true", dest="max_coverage",
+                        help="Never skip Pronto: send every company to the Pronto import "
+                             "to maximize contacts; reusable DB contacts are still pulled "
+                             "along and deduped downstream (Step 4). Use when the ask is "
+                             "'as many contacts as possible', not 'at least N'.")
     args = parser.parse_args()
 
     # ── Resolve paths ─────────────────────────────────────────────────────────
@@ -314,7 +385,10 @@ def main():
             no_linkedin_count += 1
             if domain:
                 apollo_row = apollo_db.get(domain, {})
-                linkedin_uid = apollo_row.get('linkedin_uid', '')
+                linkedin_uid = sanitize_linkedin_uid(
+                    apollo_row.get('linkedin_uid', ''),
+                    company.get('linkedin_company_url', ''),
+                )
                 pronto_import_rows.append({
                     'Company Name': company_name,
                     'Company Website': domain,
@@ -326,26 +400,39 @@ def main():
         # Look up contacts in DB
         db_contacts_for_company = db_by_company.get(co_li, [])
 
-        # Filter to valid contacts using title rules
+        # All passing inclusion rules — these are pulled through to step4 regardless
         valid_contacts = [
             c for c in db_contacts_for_company
             if is_valid_contact(c.get('title', ''))
         ]
+        # Only Finance/Revenue/Ops count toward "covered by DB" — Sales doesn't
+        # qualify (supplement persona) because we still want senior finance/revenue/
+        # ops leads at the same company. Origin: the Dust false-coverage bug
+        # (2026-05-26); founders previously played this supplement role but are now
+        # dropped entirely.
+        primary_contacts = [
+            c for c in db_contacts_for_company
+            if is_primary_persona(c.get('title', ''))
+        ]
 
-        if len(valid_contacts) >= 2:
-            # Covered by DB: pull contacts
+        if not args.max_coverage and len(primary_contacts) >= args.min_contacts:
+            # Covered by DB: pull ALL valid contacts (Sales included as supplement)
             covered_count += 1
             for c in valid_contacts:
                 db_contact_rows.append(c)
         else:
-            # Need Pronto search (0-1 valid contacts or not in DB)
+            # Need Pronto search — and still pull any valid DB contacts (incl. Sales
+            # supplement) along so they don't get lost. Step 4 dedups by LinkedIn URL.
             need_search_count += 1
-            # Look up linkedin_uid from Apollo DB
+            for c in valid_contacts:
+                db_contact_rows.append(c)
+            # Look up linkedin_uid from Apollo DB, sanitize (drops Apollo's
+            # internal 24-char org_ids that masquerade as LinkedIn IDs)
             apollo_row = apollo_db.get(domain, {})
-            linkedin_uid = apollo_row.get('linkedin_uid', '')
-            # Fall back to extracting slug from URL if no numeric ID
-            if not linkedin_uid:
-                linkedin_uid = extract_linkedin_id(co_li)
+            linkedin_uid = sanitize_linkedin_uid(
+                apollo_row.get('linkedin_uid', ''),
+                company.get('linkedin_company_url', '') or co_li,
+            )
 
             pronto_import_rows.append({
                 'Company Name': company_name,
